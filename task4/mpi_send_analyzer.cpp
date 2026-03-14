@@ -30,12 +30,16 @@ void test_message_time(int rank, int size, const std::string& send_type) {
 
         MPI_Status status;
         double elapsed_time = 0.0;
+        double recv_wait_time = 0.0;
 
         if (rank == 0) {
             std::cout << "Тестирование размера " << msg_size << "\n";
 
-            if (send_type == "MPI_Send" || send_type == "MPI_Ssend") {
+            if (send_type == "MPI_Send") {
                 elapsed_time = send_time_measuring(MPI_Send, send_buffer.data(), msg_size, 
+                                                MPI_CHAR, 1, 0, MPI_COMM_WORLD, rank);
+            } else if (send_type == "MPI_Ssend") {
+                elapsed_time = send_time_measuring(MPI_Ssend, send_buffer.data(), msg_size, 
                                                 MPI_CHAR, 1, 0, MPI_COMM_WORLD, rank);
             }
             else if (send_type == "MPI_Bsend") {
@@ -47,7 +51,6 @@ void test_message_time(int rank, int size, const std::string& send_type) {
                 MPI_Buffer_detach(bsnd_buffer.data(), &buffer_size);
             }
             else if (send_type == "MPI_Rsend") {
-                // проверяем что receive готов
                 int ready_signal = 1;
                 int ack;
                 MPI_Send(&ready_signal, 1, MPI_INT, 1, 1, MPI_COMM_WORLD);
@@ -58,7 +61,6 @@ void test_message_time(int rank, int size, const std::string& send_type) {
                 elapsed_time = send_time_measuring(MPI_Rsend, send_buffer.data(), msg_size, 
                                                 MPI_CHAR, 1, 0, MPI_COMM_WORLD, rank);
             }
-            std::this_thread::sleep_for(std::chrono::seconds(2));
             
             MPI_Recv(recv_buffer.data(), msg_size, MPI_CHAR, 1, 0, MPI_COMM_WORLD, &status);
             
@@ -68,12 +70,13 @@ void test_message_time(int rank, int size, const std::string& send_type) {
         else if (rank == 1) {
             if (send_type == "MPI_Rsend") {
                 int ready_signal;
+                auto recv_start = std::chrono::high_resolution_clock::now();
                 MPI_Recv(&ready_signal, 1, MPI_INT, 0, 1, MPI_COMM_WORLD, &status);
                 
                 int ack = 1;
                 MPI_Send(&ack, 1, MPI_INT, 0, 2, MPI_COMM_WORLD);
             }
-            
+            std::this_thread::sleep_for(std::chrono::seconds(3));
             MPI_Recv(recv_buffer.data(), msg_size, MPI_CHAR, 0, 0, MPI_COMM_WORLD, &status);
             MPI_Send(recv_buffer.data(), msg_size, MPI_CHAR, 0, 0, MPI_COMM_WORLD);
         }
