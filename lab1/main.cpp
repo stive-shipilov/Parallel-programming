@@ -2,19 +2,20 @@
 #include <iostream>
 #include <vector>
 #include <string>
-#include <unistd.h>
+#include <cmath>
+#include <fstream>
+#include <functional>
+#include <chrono>
 
 template<typename T>
 class Matrix {
 private:
-    std::vector<std::vector<T>> data = ;
+    std::vector<T> data;
     size_t rows, cols;
     
 public:
     Matrix(size_t rows, size_t cols) 
-        : rows(rows), cols(cols), data(rows * cols) {
-        std::vector<std::vector<T>> data(rows, std::vector<int>(cols, 0));
-    }
+        : rows(rows), cols(cols), data(rows * cols, T()) {}
     
     T& operator()(size_t i, size_t j) {
         return data[i * cols + j];
@@ -26,91 +27,173 @@ public:
     
     size_t getRows() const { return rows; }
     size_t getCols() const { return cols; }
-
-    void setElement(int row, int column, double value) {
-        data[row][column] = value;
+    
+    void fill(const T& value) {
+        std::fill(data.begin(), data.end(), value);
     }
 };
 
 class TransferEquation {
-    private:
-        int x_points = 0;
-        int t_points = 0;
-        double a = 0.0;
-        double X = 0.0;
-        double T = 0.0;
-        double nu = 0.0;
+private:
+    int x_points = 0;
+    int t_points = 0;
+    double a = 0.0;
+    double X = 0.0;
+    double T_max = 0.0;
+    double nu = 0.0;
+    double h = 0.0;
+    double tau = 0.0;
 
-    public:
-        TransferEquation() = default;
-        
-        explicit TransferEquation(double a) : a(a) {}
-        
-        void setXNumberPoints(int points) {
-            x_points = points;
-        }
-        
-        void setTNumberPoints(int points) {
-            t_points = points;
-        }
-        
-        void setTCondition(double temperature) {
-            T = temperature;
-        }
-        
-        void setXCondition(double coordinate) {
-            X = coordinate;
-        }
-        
-        int getXPoints() const { return x_points; }
-        int getTPoints() const { return t_points; }
-        double getA() const { return a; }
-        double getXCondition() const { return X; }
-        double getTCondition() const { return T; }
+    int rank = 0, size = 1;
+    std::vector<double> ghost_left;
+    std::vector<double> ghost_right;
 
-        bool verifyMinStep() {
-            double tau = T/double(t_points);
-            double h = X/double(x_points);
-            nu = a*tau/h;
-            if (nu <= 1) {
-                return true;
+    std::function<double(double, double)> function;
+
+public:
+    TransferEquation() = default;
+
+    void setMPI(int r, int s) {
+        rank = r;
+        size = s;
+    }
+    
+    void setXNumberPoints(int points) {
+        x_points = points;
+        if (X > 0) h = X / (x_points - 1);
+    }
+    
+    void setTNumberPoints(int points) {
+        t_points = points;
+        if (T_max > 0) tau = T_max / (t_points - 1);
+        ghost_left.resize(t_points, 0.0);
+        ghost_right.resize(t_points, 0.0);
+    }
+
+    void setFunction(std::function<double(double, double)> func) {
+        function = func;
+    }
+    
+    void setTCondition(double temperature) {
+        T_max = temperature;
+        if (t_points > 0) tau = T_max / (t_points - 1);
+    }
+    
+    void setXCondition(double coordinate) {
+        X = coordinate;
+        if (x_points > 0) h = X / (x_points - 1);
+    }
+    
+    void setA(double a_value) {
+        a = a_value;
+    }
+    
+    int getXPoints() const { return x_points; }
+    int getTPoints() const { return t_points; }
+    double getH() const { return h; }
+    double getTau() const { return tau; }
+    double getNu() { 
+        nu = a * tau / h;
+        return nu; 
+    }
+
+    bool verifyMinStep() {
+        nu = a * tau / h;
+        return std::abs(nu) <= 1.0;
+    }
+
+    template<typename Func>
+    void computeXInitialCondition(Func func, Matrix<double>& grid) {
+        for(int x = 0; x < x_points; x++) {
+            double coord = x * h;
+            grid(x, 0) = func(coord);
+        }
+    }
+
+    template<typename Func>
+    void computeTInitialCondition(Func func, Matrix<double>& grid) {
+        for(int t = 0; t < t_points; t++) {
+            double coord = t * tau;
+            grid(0, t) = func(coord);
+        }
+    }
+    
+    void computeFirstTimeLayer(Matrix<double>& grid) {
+        // Схема "против потока" для первого слоя
+        for(int x = 1; x < x_points; x++) {
+            grid(x, 1) = grid(x, 0) - getNu() * (grid(x, 0) - grid(x-1, 0)) 
+                    + tau * function(x*h, 0);
+        }
+    }
+    
+    void computeBlock(Matrix<double>& grid, int start_x, int end_x) {
+    // Для схемы "крест" нужно хранить два предыдущих слоя
+    for(int t = 1; t < t_points - 1; t++) {
+        // Обмен призрачными точками для слоя t
+        if (rank > 0) {
+            MPI_Send(&grid(start_x, t), 1, MPI_DOUBLE, rank-1, 0, MPI_COMM_WORLD);
+            MPI_Recv(&ghost_left[t], 1, MPI_DOUBLE, rank-1, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        }
+        
+        if (rank < size - 1) {
+            MPI_Send(&grid(end_x, t), 1, MPI_DOUBLE, rank+1, 1, MPI_COMM_WORLD);
+            MPI_Recv(&ghost_right[t], 1, MPI_DOUBLE, rank+1, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        }
+        
+        // Схема "крест" (leapfrog) для внутренних точек
+        for(int x = start_x + 1; x <= end_x - 1; x++) {
+            // Второй порядок: центральные разности по времени и пространству
+            grid(x, t+1) = grid(x, t-1) - getNu() * (grid(x+1, t) - grid(x-1, t))
+                         + 2 * tau * function(x*h, t*tau);
+            if(rank == size - 1) {
+                grid(end_x, t) = grid(end_x, t-1) 
+                                - getNu() * (grid(end_x, t-1) - grid(end_x-1, t-1));
             }
-            return false;
+        }
+        
+        // Левая граница блока
+        if (rank > 0 && start_x > 0) {
+            double u_right = grid(start_x + 1, t);
+            double u_left = ghost_left[t];
+            
+            grid(start_x, t+1) = grid(start_x, t-1) - getNu() * (u_right - u_left)
+                               + 2 * tau * function(start_x*h, t*tau);
+        }
+        
+        // Правая граница блока
+        if (rank < size - 1 && end_x < x_points - 1) {
+            double u_left = grid(end_x - 1, t);
+            double u_right = ghost_right[t];
+            
+            grid(end_x, t+1) = grid(end_x, t-1) - getNu() * (u_right - u_left)
+                             + 2 * tau * function(end_x*h, t*tau);
         }
 
-        template<typename Func>
-        void computeTBorders(Func func, Matrix<dobule>& grid) {
-            for(int t = 0; t < t_points; t++) {
-                grid[0, t] = func(t);
-            }
-        }
-
-        template<typename Func>
-        void computeXBorders(Func func, Matrix<dobule>& grid) {
-            for(int x = 0; x < x_points; x++) {
-                grid[x, 0] = func(x);
-            }
-        }
-
-        void computeBlock(Matrix<dobule>& grid, int start, int end) {
-            for(int computedRow = 3; computedRow < t_points; computedRow++) {
-                int currentColumnId = start + 1;
-                while(currentColumnId <= (end - 1)) {
-                    grid[computedRow][currentColumnId] = grid[computedRow][currentColumnId - 1] - nu * (grid[computedRow + 1][currentColumnId] - grid[computedRow - 1][currentColumnId]);
-                    currentColumnId++;
-                }
-            }
-        }
-
-        void computeXLine(Matrix<dobule>& grid, int columnId) {
-            for(int computedRow = 3; computedRow < t_points; computedRow++) {
-                    grid[computedRow][columnId] = grid[computedRow][columnId - 1] - nu * (grid[computedRow + 1][columnId] - grid[computedRow - 1][columnId]);
-                    currentColumnId++;
-            }
-        }
-
+    }
+}
 };
 
+void writeSolutionToFile(const Matrix<double>& grid, int x_points, int t_points,
+                         double X, double T, const std::string& filename) {
+    std::ofstream file(filename);
+    
+    file << "# Решение уравнения переноса (схема крест)\n";
+    file << "# ∂u/∂t + a ∂u/∂x = 0\n";
+    file << "# X = " << X << ", T = " << T << "\n";
+    file << "# nx = " << x_points << ", nt = " << t_points << "\n";
+    file << "# Формат: x t u(x,t)\n\n";
+    
+    for(int t = 0; t < t_points; t++) {
+        for(int x = 0; x < x_points; x++) {
+            double x_coord = x * X / (x_points - 1);
+            double t_coord = t * T / (t_points - 1);
+            file << x_coord << " " << t_coord << " " << grid(x, t) << "\n";
+        }
+        if (t < t_points - 1) file << "\n";
+    }
+    
+    file.close();
+}
 
 int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
@@ -119,63 +202,140 @@ int main(int argc, char** argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    MPI_Status status;
-
-    if (argc != 4) {
-        std::cerr << "Не все аргумент переданы";
-    }
-
-    int x_points = 10000;
-    int t_points = 10000;
+    // Параметры задачи
+    double T_condition = 1.0;
+    double X_condition = 1.0;
+    double a = 1.0;
     
-    TransferEquation equation = TransferEquation();
-    equation.setTCondition(std::stod(argv[1]));
-    equation.setXCondition(std::stod(argv[2]));
-    equation.setXCondition(std::stod(argv[3]));
-
+    int x_points = 1000;
+    int t_points = 1000;
+    
+    if (argc > 1) T_condition = std::stod(argv[1]);
+    if (argc > 2) X_condition = std::stod(argv[2]);
+    if (argc > 3) a = std::stod(argv[3]);
+    
+    TransferEquation equation;
+    equation.setTCondition(5.0);   // T = 5 секунд
+    equation.setXCondition(10.0);  // X = 10 метров
+    equation.setA(1.0);            // скорость 1 м/с
+    
     equation.setXNumberPoints(x_points);
     equation.setTNumberPoints(t_points);
+    equation.setMPI(rank, size);
 
-    int block_size = equation.getTPoints() / size;
-    int remainder = equation.getTPoints() % size;
-
-    Matrix<double> gridSolution = Matrix(equation.getXPoints, equation.getTPoints);
-
-    equation.computeTBorders([](double t) { return t*t; }, gridSolution);
-    equation.computeXBorders([](double x) { return x*x; }, gridSolution);
-
-    int start, end;
-    double local_sum;
-
-    if (rank < remainder) {
-        start = rank * (block_size + 1);
-        end = start + block_size;
-        local_sum = equation.computeBlock(gridSolution, start, end);
-    } else {
-        start = rank * block_size + remainder;
-        end = start + block_size - 1;
-        local_sum = equation.computeBlock(gridSolution, start, end);
+    if (!equation.verifyMinStep()) {
+        if (rank == 0) {
+            std::cout << "ОШИБКА: Число Куранта = " << equation.getNu() 
+                      << " > 1! Решение неустойчиво.\n";
+            std::cout << "Увеличьте x_points или уменьшите t_points\n";
+        }
+        MPI_Finalize();
+        return 1;
     }
+    
+    Matrix<double> localGrid(x_points, t_points);
+    localGrid.fill(0.0);
+    
+    // Начальное условие: гауссов пакет
+    double x0 = X_condition / 2.0;
+    double sigma = X_condition / 25.0;
+    
+    // Начальное условие: φ(x) = sin(x)
+    equation.computeXInitialCondition([](double x) { 
+        return sin(x);
+    }, localGrid);
 
-    MPI_Barrier(MPI_COMM_WORLD);
+    // Граничное условие: ψ(t) = -sin(t)  (на левой границе x=0)
+    equation.computeTInitialCondition([](double t) { 
+        return -sin(t);
+    }, localGrid);
 
-    double global_sum = 0.0;
-    MPI_Reduce(&local_sum, &global_sum, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    // Источник: f(t,x) = -sin(x - t)
+    equation.setFunction([](double x, double t) { 
+        return 0.0;  // Нет источника, уравнение однородное
+    });
+    
+    equation.computeFirstTimeLayer(localGrid);
 
-    MPI_Barrier(MPI_COMM_WORLD);
-
-    if (rank != size - 1) {
-        if (rank < remainder) {
-            start = rank * (block_size + 1);
-            end = start + block_size;
-            local_sum = equation.computeXLine(gridSolution, start);
-        } else {
-            start = rank * block_size + remainder;
-            end = start + block_size - 1;
-            local_sum = equation.computeXLine(gridSolution, start);
+    
+    // Распределение блоков
+    int cols_to_compute = x_points - 2;
+    int block_size = cols_to_compute / size;
+    int remainder = cols_to_compute % size;
+    
+    int start_x, end_x;
+    
+    if (rank < remainder) {
+        start_x = rank * (block_size + 1);
+        end_x = start_x + block_size;
+    } else {
+        start_x = rank * block_size + remainder;
+        end_x = start_x + block_size - 1;
+    }
+    
+    if (rank == 0) {
+        std::cout << "\n=== Распределение вычислений ===\n";
+    }
+    
+    std::cout << "Процесс " << rank << ": x = [" << start_x << ", " << end_x 
+              << "], точек: " << (end_x - start_x + 1) << "\n";
+    
+    auto start_time = MPI_Wtime();
+    
+    equation.computeBlock(localGrid, start_x, end_x);
+    
+    auto end_time = MPI_Wtime();
+    double elapsed = end_time - start_time;
+    
+    if (rank == 0) {
+        std::cout << "\nВремя вычислений: " << elapsed << " сек\n";
+    }
+    
+    // Сбор результатов
+    Matrix<double> fullGrid(x_points, t_points);
+    
+    if (rank == 0) {
+        // Копируем свою часть
+        for(int x = 0; x < x_points; x++) {
+            for(int t = 0; t < t_points; t++) {
+                fullGrid(x, t) = localGrid(x, t);
+            }
+        }
+        
+        // Принимаем данные от других процессов
+        for(int p = 1; p < size; p++) {
+            int p_start_x, p_end_x;
+            if (p < remainder) {
+                p_start_x = p * (block_size + 1);
+                p_end_x = p_start_x + block_size;
+            } else {
+                p_start_x = p * block_size + remainder;
+                p_end_x = p_start_x + block_size - 1;
+            }
+            
+            p_start_x = std::max(p_start_x, 1);
+            p_end_x = std::min(p_end_x, x_points - 2);
+            
+            for(int x = p_start_x; x <= p_end_x; x++) {
+                MPI_Recv(&fullGrid(x, 0), t_points, MPI_DOUBLE, p, x, 
+                        MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            }
+        }
+        
+        // Сохраняем результат
+        std::string filename = "solution.dat";
+        if (argc > 4) filename = argv[4];
+        
+        writeSolutionToFile(fullGrid, x_points, t_points, X_condition, T_condition, filename);
+        
+        std::cout << "\nРезультат сохранен в " << filename << "\n";
+        
+    } else if (start_x <= end_x) {
+        for(int x = start_x; x <= end_x; x++) {
+            MPI_Send(&localGrid(x, 0), t_points, MPI_DOUBLE, 0, x, MPI_COMM_WORLD);
         }
     }
-
+    
     MPI_Finalize();
     return 0;
 }
