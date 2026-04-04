@@ -119,7 +119,7 @@ public:
     }
     
     void computeFirstTimeLayer(Matrix<double>& grid) {
-        // Схема "против потока" для первого слоя
+        // Вычисление второго врменного слоя методо левого угла
         for(int x = 1; x < x_points; x++) {
             grid(x, 1) = grid(x, 0) - getNu() * (grid(x, 0) - grid(x-1, 0)) 
                     + tau * function(x*h, 0);
@@ -127,9 +127,8 @@ public:
     }
     
     void computeBlock(Matrix<double>& grid, int start_x, int end_x) {
-    // Для схемы "крест" нужно хранить два предыдущих слоя
     for(int t = 1; t < t_points - 1; t++) {
-        // Обмен призрачными точками для слоя t
+        // Обмен крайними слоями
         if (rank > 0) {
             MPI_Send(&grid(start_x, t), 1, MPI_DOUBLE, rank-1, 0, MPI_COMM_WORLD);
             MPI_Recv(&ghost_left[t], 1, MPI_DOUBLE, rank-1, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
@@ -140,9 +139,7 @@ public:
             MPI_Recv(&ghost_right[t], 1, MPI_DOUBLE, rank+1, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
         }
         
-        // Схема "крест" (leapfrog) для внутренних точек
         for(int x = start_x + 1; x <= end_x - 1; x++) {
-            // Второй порядок: центральные разности по времени и пространству
             grid(x, t+1) = grid(x, t-1) - getNu() * (grid(x+1, t) - grid(x-1, t))
                          + 2 * tau * function(x*h, t*tau);
             if(rank == size - 1) {
@@ -151,7 +148,6 @@ public:
             }
         }
         
-        // Левая граница блока
         if (rank > 0 && start_x > 0) {
             double u_right = grid(start_x + 1, t);
             double u_left = ghost_left[t];
@@ -160,7 +156,6 @@ public:
                                + 2 * tau * function(start_x*h, t*tau);
         }
         
-        // Правая граница блока
         if (rank < size - 1 && end_x < x_points - 1) {
             double u_left = grid(end_x - 1, t);
             double u_right = ghost_right[t];
@@ -202,7 +197,6 @@ int main(int argc, char** argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    // Параметры задачи
     double T_condition = 1.0;
     double X_condition = 1.0;
     double a = 1.0;
@@ -215,9 +209,9 @@ int main(int argc, char** argv) {
     if (argc > 3) a = std::stod(argv[3]);
     
     TransferEquation equation;
-    equation.setTCondition(5.0);   // T = 5 секунд
-    equation.setXCondition(10.0);  // X = 10 метров
-    equation.setA(1.0);            // скорость 1 м/с
+    equation.setTCondition(5.0);
+    equation.setXCondition(10.0);
+    equation.setA(1.0);
     
     equation.setXNumberPoints(x_points);
     equation.setTNumberPoints(t_points);
@@ -240,25 +234,21 @@ int main(int argc, char** argv) {
     double x0 = X_condition / 2.0;
     double sigma = X_condition / 25.0;
     
-    // Начальное условие: φ(x) = sin(x)
     equation.computeXInitialCondition([](double x) { 
         return sin(x);
     }, localGrid);
 
-    // Граничное условие: ψ(t) = -sin(t)  (на левой границе x=0)
     equation.computeTInitialCondition([](double t) { 
         return -sin(t);
     }, localGrid);
 
-    // Источник: f(t,x) = -sin(x - t)
     equation.setFunction([](double x, double t) { 
-        return 0.0;  // Нет источника, уравнение однородное
+        return 0.0;
     });
     
     equation.computeFirstTimeLayer(localGrid);
 
     
-    // Распределение блоков
     int cols_to_compute = x_points - 2;
     int block_size = cols_to_compute / size;
     int remainder = cols_to_compute % size;
@@ -288,21 +278,18 @@ int main(int argc, char** argv) {
     double elapsed = end_time - start_time;
     
     if (rank == 0) {
-        std::cout << "\nВремя вычислений: " << elapsed << " сек\n";
+        std::cout << "Incorrect вычислений: " << elapsed << " сек\n";
     }
     
-    // Сбор результатов
     Matrix<double> fullGrid(x_points, t_points);
     
     if (rank == 0) {
-        // Копируем свою часть
         for(int x = 0; x < x_points; x++) {
             for(int t = 0; t < t_points; t++) {
                 fullGrid(x, t) = localGrid(x, t);
             }
         }
         
-        // Принимаем данные от других процессов
         for(int p = 1; p < size; p++) {
             int p_start_x, p_end_x;
             if (p < remainder) {
@@ -322,13 +309,12 @@ int main(int argc, char** argv) {
             }
         }
         
-        // Сохраняем результат
         std::string filename = "solution.dat";
         if (argc > 4) filename = argv[4];
         
         writeSolutionToFile(fullGrid, x_points, t_points, X_condition, T_condition, filename);
         
-        std::cout << "\nРезультат сохранен в " << filename << "\n";
+        std::cout << "\nРезультат сохранён в " << filename << "\n";
         
     } else if (start_x <= end_x) {
         for(int x = start_x; x <= end_x; x++) {

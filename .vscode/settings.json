@@ -1,4 +1,5 @@
 {
     "workbench.preferredHighContrastLightColorTheme": "Visual Studio Dark",
-    "workbench.preferredHighContrastColorTheme": "Visual Studio Dark"
+    "workbench.preferredHighContrastColorTheme": "Visual Studio Dark",
+    "cquery.cacheDirectory": "${workspaceFolder}/.vscode/cquery_cached_index/"
 }
