@@ -45,6 +45,10 @@ private:
     double tau = 0.0;
 
     int rank = 0, size = 1;
+
+    double total_comm_time = 0.0;
+    int comm_count = 0;  
+
     std::vector<double> ghost_left;
     std::vector<double> ghost_right;
 
@@ -97,6 +101,11 @@ public:
         return nu; 
     }
 
+    double getAverageCommTime() const {
+        if (comm_count == 0) return 0.0;
+        return total_comm_time / comm_count;
+    }
+
     bool verifyMinStep() {
         nu = a * tau / h;
         return std::abs(nu) <= 1.0;
@@ -130,13 +139,24 @@ public:
     for(int t = 1; t < t_points - 1; t++) {
         // Обмен крайними слоями
         if (rank > 0) {
+            auto t1 = MPI_Wtime();  // ЗАМЕР НАЧАЛА
             MPI_Send(&grid(start_x, t), 1, MPI_DOUBLE, rank-1, 0, MPI_COMM_WORLD);
             MPI_Recv(&ghost_left[t], 1, MPI_DOUBLE, rank-1, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+            auto t2 = MPI_Wtime();  // ЗАМЕР КОНЦА
+            total_comm_time += (t2 - t1);
+            comm_count += 2;
         }
         
         if (rank < size - 1) {
+            auto t1 = MPI_Wtime();  // ЗАМЕР НАЧАЛА
+
             MPI_Send(&grid(end_x, t), 1, MPI_DOUBLE, rank+1, 1, MPI_COMM_WORLD);
             MPI_Recv(&ghost_right[t], 1, MPI_DOUBLE, rank+1, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+            auto t2 = MPI_Wtime();  // ЗАМЕР КОНЦА
+            total_comm_time += (t2 - t1);
+            comm_count += 2;
         }
         
         for(int x = start_x + 1; x <= end_x - 1; x++) {
@@ -277,8 +297,15 @@ int main(int argc, char** argv) {
     auto end_time = MPI_Wtime();
     double elapsed = end_time - start_time;
     
+    double local_avg = equation.getAverageCommTime();
+    double global_avg = 0.0;
+
+
+    MPI_Reduce(&local_avg, &global_avg, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+
     if (rank == 0) {
-        std::cout << "Incorrect вычислений: " << elapsed << " сек\n";
+        std::cout << "Среднее время на процесс: " << (global_avg / size) << " сек\n";
+        std::cout << "Время вычислений: " << elapsed << " сек\n";
     }
     
     Matrix<double> fullGrid(x_points, t_points);
@@ -309,9 +336,9 @@ int main(int argc, char** argv) {
             }
         }
         
-        std::string filename = "solution.dat";
+        std::string filename = "solution2.dat";
         if (argc > 4) filename = argv[4];
-        
+        std::cout << "Идёт запись в файл" << "\n";
         writeSolutionToFile(fullGrid, x_points, t_points, X_condition, T_condition, filename);
         
         std::cout << "\nРезультат сохранён в " << filename << "\n";

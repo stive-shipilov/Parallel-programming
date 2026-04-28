@@ -42,6 +42,6 @@ for i, time in enumerate([0, 1, 2, 3, 4, 5]):
         plt.grid(True)
         plt.ylim(-1.5, 1.5)
 
-plt.suptitle('Сравнение: численное vs разные "точные" решения', fontsize=14)
+plt.suptitle('Численное решения', fontsize=14)
 plt.tight_layout()
 plt.show()
